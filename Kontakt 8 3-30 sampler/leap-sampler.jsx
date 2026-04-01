@@ -7,6 +7,9 @@ const AudioCtx = {
   voices: new Map(),
   buffers: new Map(),
   midiAccess: null,
+  workletReady: false,
+  // Cache extracted channel data per AudioBuffer to avoid re-copying
+  _bufferCache: new WeakMap(),
   init() {
     if (this.ctx) return this.ctx;
     this.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
@@ -14,6 +17,12 @@ const AudioCtx = {
     this.masterGain.gain.value = 0.8;
     this.masterGain.connect(this.ctx.destination);
     return this.ctx;
+  },
+  async initWorklet() {
+    if (this.workletReady) return;
+    const ctx = this.init();
+    await ctx.audioWorklet.addModule("sampler-worklet-processor.js");
+    this.workletReady = true;
   },
   async initMidi(onMessage) {
     try {
@@ -23,6 +32,17 @@ const AudioCtx = {
       }
       return true;
     } catch { return false; }
+  },
+  // Extract and cache channel data from an AudioBuffer for worklet transfer
+  _getChannelData(buffer) {
+    let cached = this._bufferCache.get(buffer);
+    if (cached) return cached;
+    const channelData = [];
+    for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+      channelData.push(new Float32Array(buffer.getChannelData(ch)));
+    }
+    this._bufferCache.set(buffer, channelData);
+    return channelData;
   },
   generateDemoBuffer(type = "drums", bpm = 128) {
     const ctx = this.init();
@@ -72,36 +92,60 @@ const AudioCtx = {
     return buf;
   },
   playSlice(buffer, start, end, params = {}) {
-    if (!this.ctx || !buffer) return null;
-    const src = this.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.playbackRate.value = params.speed || 1;
-    if (params.reverse) {
-      const revBuf = this.ctx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
-      for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
-        const orig = buffer.getChannelData(ch);
-        const rev = revBuf.getChannelData(ch);
-        for (let i = 0; i < orig.length; i++) rev[i] = orig[orig.length - 1 - i];
-      }
-      src.buffer = revBuf;
-    }
-    // ADSR with velocity scaling
-    const env = this.ctx.createGain();
-    const vel = params.velocity !== undefined ? params.velocity : 1;
-    const now = this.ctx.currentTime;
-    const a = params.attack || 0.005, d = params.decay || 0.1, s = params.sustain || 0.7, r = params.release || 0.2;
-    env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(vel, now + a);
-    env.gain.linearRampToValueAtTime(s * vel, now + a + d);
-    // Filter
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = params.filterType || "lowpass";
-    filter.frequency.value = params.filterFreq || 8000;
-    filter.Q.value = params.filterQ || 1;
-    src.connect(filter);
-    filter.connect(env);
-    // Delay
-    let lastNode = env;
+    if (!this.ctx || !buffer || !this.workletReady) return null;
+    const sr = this.ctx.sampleRate;
+    const startSample = Math.floor(start * sr);
+    const endSample = Math.floor(end * sr);
+
+    // Create AudioWorkletNode for this voice
+    const node = new AudioWorkletNode(this.ctx, "sampler-worklet-processor", {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [buffer.numberOfChannels],
+      processorOptions: {
+        velocity: params.velocity !== undefined ? params.velocity : 1,
+        speed: params.speed || 1,
+        reverse: params.reverse || false,
+        loop: params.loop || false,
+        attack: params.attack || 0.005,
+        decay: params.decay || 0.1,
+        sustain: params.sustain || 0.7,
+        release: params.release || 0.2,
+        filterType: params.filterType || "lowpass",
+        filterFreq: params.filterFreq || 8000,
+        filterQ: params.filterQ || 1,
+      },
+    });
+
+    // Send buffer data to the worklet (copies, not transfers, so buffer stays usable)
+    const channelData = this._getChannelData(buffer);
+    node.port.postMessage({
+      type: "loadBuffer",
+      channelData: channelData,
+    });
+
+    // Tell the worklet to start playing
+    node.port.postMessage({
+      type: "play",
+      startSample,
+      endSample,
+      params: {
+        velocity: params.velocity !== undefined ? params.velocity : 1,
+        speed: params.speed || 1,
+        reverse: params.reverse || false,
+        loop: params.loop || false,
+        attack: params.attack || 0.005,
+        decay: params.decay || 0.1,
+        sustain: params.sustain || 0.7,
+        release: params.release || 0.2,
+        filterType: params.filterType || "lowpass",
+        filterFreq: params.filterFreq || 8000,
+        filterQ: params.filterQ || 1,
+      },
+    });
+
+    // Delay effect chain (remains on main thread — delay is post-worklet)
+    let lastNode = node;
     if (params.delayTime > 0) {
       const delay = this.ctx.createDelay(2);
       delay.delayTime.value = params.delayTime || 0;
@@ -109,23 +153,33 @@ const AudioCtx = {
       fb.gain.value = params.delayFeedback || 0.3;
       const wet = this.ctx.createGain();
       wet.gain.value = params.delayMix || 0.3;
-      env.connect(delay);
+      node.connect(delay);
       delay.connect(fb);
       fb.connect(delay);
       delay.connect(wet);
       wet.connect(this.masterGain);
     }
-    env.connect(this.masterGain);
-    const duration = end - start;
-    src.start(0, start, params.loop ? undefined : duration);
-    if (params.loop) { src.loop = true; src.loopStart = start; src.loopEnd = end; }
-    return { src, env, filter, stop: () => {
-      const t = this.ctx.currentTime;
-      env.gain.cancelScheduledValues(t);
-      env.gain.setValueAtTime(env.gain.value, t);
-      env.gain.linearRampToValueAtTime(0, t + r);
-      src.stop(t + r + 0.01);
-    }};
+    node.connect(this.masterGain);
+
+    // Clean up when worklet signals it has finished
+    node.port.onmessage = (e) => {
+      if (e.data.type === "ended") {
+        node.disconnect();
+      }
+    };
+
+    return {
+      node,
+      stop: () => {
+        // Send release message to worklet — envelope handles fade-out
+        node.port.postMessage({ type: "release" });
+        // Safety disconnect after release time
+        const r = params.release || 0.2;
+        setTimeout(() => {
+          try { node.disconnect(); } catch {}
+        }, (r + 0.05) * 1000);
+      },
+    };
   }
 };
 
@@ -301,8 +355,9 @@ export default function LEAPSampler() {
   useEffect(() => { delayRef.current = delay; }, [delay]);
 
   // ─── Init Audio ───
-  const initAudio = useCallback(() => {
+  const initAudio = useCallback(async () => {
     AudioCtx.init();
+    await AudioCtx.initWorklet();
     const buf = AudioCtx.generateDemoBuffer("drums", 128);
     setBuffer(buf);
     setAudioReady(true);
