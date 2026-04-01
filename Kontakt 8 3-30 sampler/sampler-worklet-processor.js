@@ -34,6 +34,14 @@ function computeBiquadCoeffs(type, freq, Q, sampleRate) {
       a1 = -2 * cosW0;
       a2 = 1 - alpha;
       break;
+    case "notch":
+      b0 = 1;
+      b1 = -2 * cosW0;
+      b2 = 1;
+      a0 = 1 + alpha;
+      a1 = -2 * cosW0;
+      a2 = 1 - alpha;
+      break;
     case "lowpass":
     default:
       b0 = (1 - cosW0) / 2;
@@ -101,6 +109,10 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
     this._filterZ1 = [];
     this._filterZ2 = [];
 
+    // Drive/saturation
+    this._driveAmount = 0; // 0 = clean, 1 = full saturation
+    this._driveCurve = "soft"; // "soft", "hard", "clip"
+
     // Parse processor options if provided
     if (options && options.processorOptions) {
       this._applyOptions(options.processorOptions);
@@ -121,6 +133,8 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
     if (opts.filterType !== undefined) this._filterType = opts.filterType;
     if (opts.filterFreq !== undefined) this._filterFreq = opts.filterFreq;
     if (opts.filterQ !== undefined) this._filterQ = opts.filterQ;
+    if (opts.driveAmount !== undefined) this._driveAmount = opts.driveAmount;
+    if (opts.driveCurve !== undefined) this._driveCurve = opts.driveCurve;
   }
 
   _handleMessage(msg) {
@@ -241,6 +255,26 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
     this._filterZ1[ch] = c.b1 * sample - c.a1 * out + z2;
     this._filterZ2[ch] = c.b2 * sample - c.a2 * out;
     return out;
+  }
+
+  // Apply drive/saturation to a sample
+  _applyDrive(sample) {
+    if (this._driveAmount <= 0) return sample;
+    const gain = 1 + this._driveAmount * 10; // Up to 11x input gain
+    const driven = sample * gain;
+    switch (this._driveCurve) {
+      case "hard":
+        return Math.max(-1, Math.min(1, driven)) * (1 / gain + (1 - 1 / gain));
+      case "clip":
+        return Math.max(-1, Math.min(1, driven));
+      case "soft":
+      default: {
+        // tanh soft clipping
+        const out = Math.tanh(driven);
+        // Compensate output level
+        return out * (1 / Math.tanh(gain));
+      }
+    }
   }
 
   // Advance ADSR envelope by one sample, returns envelope level
@@ -367,6 +401,9 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
 
         // Apply biquad filter
         sample = this._applyFilter(sample, bufCh);
+
+        // Apply drive/saturation
+        sample = this._applyDrive(sample);
 
         // Apply envelope
         sample *= envLevel;

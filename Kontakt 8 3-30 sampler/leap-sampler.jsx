@@ -4,6 +4,8 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 const AudioCtx = {
   ctx: null,
   masterGain: null,
+  delayBus: null,
+  reverbBus: null,
   voices: new Map(),
   buffers: new Map(),
   midiAccess: null,
@@ -16,7 +18,55 @@ const AudioCtx = {
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 0.8;
     this.masterGain.connect(this.ctx.destination);
+    // Shared delay bus
+    this._initDelayBus();
+    // Shared reverb bus
+    this._initReverbBus();
     return this.ctx;
+  },
+  _initDelayBus() {
+    const ctx = this.ctx;
+    this.delayBus = { input: ctx.createGain() };
+    this.delayBus.input.gain.value = 1;
+    const delay = ctx.createDelay(2);
+    delay.delayTime.value = 0.3;
+    const fb = ctx.createGain();
+    fb.gain.value = 0.3;
+    const wet = ctx.createGain();
+    wet.gain.value = 0.5;
+    this.delayBus.input.connect(delay);
+    delay.connect(fb);
+    fb.connect(delay);
+    delay.connect(wet);
+    wet.connect(this.masterGain);
+    this.delayBus.delay = delay;
+    this.delayBus.feedback = fb;
+    this.delayBus.wet = wet;
+  },
+  _initReverbBus() {
+    const ctx = this.ctx;
+    this.reverbBus = { input: ctx.createGain() };
+    this.reverbBus.input.gain.value = 1;
+    // Generate algorithmic impulse response
+    const sr = ctx.sampleRate;
+    const len = sr * 2; // 2 second IR
+    const irBuf = ctx.createBuffer(2, len, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = irBuf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        // Exponential decay with diffuse noise
+        d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (sr * 0.6));
+      }
+    }
+    const convolver = ctx.createConvolver();
+    convolver.buffer = irBuf;
+    const wet = ctx.createGain();
+    wet.gain.value = 0.5;
+    this.reverbBus.input.connect(convolver);
+    convolver.connect(wet);
+    wet.connect(this.masterGain);
+    this.reverbBus.convolver = convolver;
+    this.reverbBus.wet = wet;
   },
   async initWorklet() {
     if (this.workletReady) return;
@@ -96,92 +146,99 @@ const AudioCtx = {
     const sr = this.ctx.sampleRate;
     const startSample = Math.floor(start * sr);
     const endSample = Math.floor(end * sr);
+    const vel = params.velocity !== undefined ? params.velocity : 1;
+
+    const procOpts = {
+      velocity: vel,
+      speed: params.speed || 1,
+      reverse: params.reverse || false,
+      loop: params.loop || false,
+      attack: params.attack || 0.005,
+      decay: params.decay || 0.1,
+      sustain: params.sustain || 0.7,
+      release: params.release || 0.2,
+      filterType: params.filterType || "lowpass",
+      filterFreq: params.filterFreq || 8000,
+      filterQ: params.filterQ || 1,
+      driveAmount: params.driveAmount || 0,
+      driveCurve: params.driveCurve || "soft",
+    };
 
     // Create AudioWorkletNode for this voice
     const node = new AudioWorkletNode(this.ctx, "sampler-worklet-processor", {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [buffer.numberOfChannels],
-      processorOptions: {
-        velocity: params.velocity !== undefined ? params.velocity : 1,
-        speed: params.speed || 1,
-        reverse: params.reverse || false,
-        loop: params.loop || false,
-        attack: params.attack || 0.005,
-        decay: params.decay || 0.1,
-        sustain: params.sustain || 0.7,
-        release: params.release || 0.2,
-        filterType: params.filterType || "lowpass",
-        filterFreq: params.filterFreq || 8000,
-        filterQ: params.filterQ || 1,
-      },
+      processorOptions: procOpts,
     });
 
-    // Send buffer data to the worklet (copies, not transfers, so buffer stays usable)
+    // Send buffer data to the worklet
     const channelData = this._getChannelData(buffer);
-    node.port.postMessage({
-      type: "loadBuffer",
-      channelData: channelData,
-    });
+    node.port.postMessage({ type: "loadBuffer", channelData });
+    node.port.postMessage({ type: "play", startSample, endSample, params: procOpts });
 
-    // Tell the worklet to start playing
-    node.port.postMessage({
-      type: "play",
-      startSample,
-      endSample,
-      params: {
-        velocity: params.velocity !== undefined ? params.velocity : 1,
-        speed: params.speed || 1,
-        reverse: params.reverse || false,
-        loop: params.loop || false,
-        attack: params.attack || 0.005,
-        decay: params.decay || 0.1,
-        sustain: params.sustain || 0.7,
-        release: params.release || 0.2,
-        filterType: params.filterType || "lowpass",
-        filterFreq: params.filterFreq || 8000,
-        filterQ: params.filterQ || 1,
-      },
-    });
+    // Per-voice volume and pan
+    const volGain = this.ctx.createGain();
+    volGain.gain.value = params.volume !== undefined ? params.volume : 1;
+    const panner = this.ctx.createStereoPanner();
+    panner.pan.value = params.pan || 0;
 
-    // Delay effect chain (remains on main thread — delay is post-worklet)
-    let lastNode = node;
-    if (params.delayTime > 0) {
-      const delay = this.ctx.createDelay(2);
-      delay.delayTime.value = params.delayTime || 0;
-      const fb = this.ctx.createGain();
-      fb.gain.value = params.delayFeedback || 0.3;
-      const wet = this.ctx.createGain();
-      wet.gain.value = params.delayMix || 0.3;
-      node.connect(delay);
-      delay.connect(fb);
-      fb.connect(delay);
-      delay.connect(wet);
-      wet.connect(this.masterGain);
-    }
-    node.connect(this.masterGain);
+    // Routing: worklet → volume → pan → dry master + send buses
+    node.connect(volGain);
+    volGain.connect(panner);
+    panner.connect(this.masterGain);
 
-    // Clean up when worklet signals it has finished
+    // Delay send
+    const delaySendGain = this.ctx.createGain();
+    delaySendGain.gain.value = params.delaySend || 0;
+    panner.connect(delaySendGain);
+    delaySendGain.connect(this.delayBus.input);
+
+    // Reverb send
+    const reverbSendGain = this.ctx.createGain();
+    reverbSendGain.gain.value = params.reverbSend || 0;
+    panner.connect(reverbSendGain);
+    reverbSendGain.connect(this.reverbBus.input);
+
+    // Cleanup when worklet finishes
+    const allNodes = [node, volGain, panner, delaySendGain, reverbSendGain];
     node.port.onmessage = (e) => {
       if (e.data.type === "ended") {
-        node.disconnect();
+        allNodes.forEach(n => { try { n.disconnect(); } catch {} });
       }
     };
 
     return {
       node,
       stop: () => {
-        // Send release message to worklet — envelope handles fade-out
         node.port.postMessage({ type: "release" });
-        // Safety disconnect after release time
         const r = params.release || 0.2;
         setTimeout(() => {
-          try { node.disconnect(); } catch {}
+          allNodes.forEach(n => { try { n.disconnect(); } catch {} });
         }, (r + 0.05) * 1000);
       },
     };
   }
 };
+
+// ─── Default per-pad signal chain params ───
+const DEFAULT_PAD_PARAMS = {
+  adsr: { attack: 0.005, decay: 0.1, sustain: 0.7, release: 0.2 },
+  filter: { type: "lowpass", freq: 8000, q: 1 },
+  drive: { amount: 0, curve: "soft" },
+  delaySend: 0,
+  reverbSend: 0,
+  volume: 1,
+  pan: 0,
+};
+
+function createPad(i) {
+  return {
+    id: i + 1, active: false, assigned: true,
+    sliceStart: i / 16, sliceEnd: (i + 1) / 16,
+    ...JSON.parse(JSON.stringify(DEFAULT_PAD_PARAMS)),
+  };
+}
 
 // ─── Waveform Drawing Utils ───
 function drawWaveform(canvas, buffer, options = {}) {
@@ -295,21 +352,18 @@ export default function LEAPSampler() {
     bpm: 128, sync: true, speed: 1, tonality: "None", tune: 0,
     loop: true, triggerStyle: "Latch", choke: "Off"
   });
-  // Pad state
-  const [pads, setPads] = useState(Array.from({ length: 16 }, (_, i) => ({
-    id: i + 1, active: false, assigned: true, sliceStart: i / 16, sliceEnd: (i + 1) / 16
-  })));
+  // Pad state (each pad has its own signal chain params)
+  const [pads, setPads] = useState(Array.from({ length: 16 }, (_, i) => createPad(i)));
   const [selectedPad, setSelectedPad] = useState(0);
+  const [padClipboard, setPadClipboard] = useState(null);
   const [padMode, setPadMode] = useState("group");
   const [startKey, setStartKey] = useState("C3");
   const [tonalityLock, setTonalityLock] = useState("G min");
   const [quantize, setQuantize] = useState("Off");
-  // Signal chain
-  const [adsr, setAdsr] = useState({ attack: 0.005, decay: 0.1, sustain: 0.7, release: 0.2 });
-  const [filter, setFilter] = useState({ type: "lowpass", freq: 8000, q: 1 });
+  // Global shared bus params
   const [lfo1, setLfo1] = useState({ rate: 1, depth: 0, shape: "sine", target: "filter" });
-  const [delay, setDelay] = useState({ time: 0, feedback: 0.3, mix: 0.3 });
-  const [reverb, setReverb] = useState({ size: 0.5, mix: 0.2 });
+  const [delayBus, setDelayBus] = useState({ time: 0.3, feedback: 0.3 });
+  const [reverbBus, setReverbBus] = useState({ size: 0.5, mix: 0.5 });
   // Hit points
   const [hitPoints, setHitPoints] = useState([]);
   const [hitSensitivity, setHitSensitivity] = useState(50);
@@ -342,17 +396,47 @@ export default function LEAPSampler() {
   const bufferRef = useRef(null);
   const padsRef = useRef(pads);
   const engineRef = useRef(engine);
-  const adsrRef = useRef(adsr);
-  const filterRef = useRef(filter);
-  const delayRef = useRef(delay);
+  const selectedPadRef = useRef(selectedPad);
 
   // ─── Keep refs in sync so MIDI callback always has latest state ───
   useEffect(() => { bufferRef.current = buffer; }, [buffer]);
   useEffect(() => { padsRef.current = pads; }, [pads]);
   useEffect(() => { engineRef.current = engine; }, [engine]);
-  useEffect(() => { adsrRef.current = adsr; }, [adsr]);
-  useEffect(() => { filterRef.current = filter; }, [filter]);
-  useEffect(() => { delayRef.current = delay; }, [delay]);
+  useEffect(() => { selectedPadRef.current = selectedPad; }, [selectedPad]);
+
+  // ─── Helpers to update selected pad's params ───
+  const updatePad = useCallback((idx, updater) => {
+    setPads(prev => prev.map((p, i) => i === idx ? (typeof updater === "function" ? updater(p) : { ...p, ...updater }) : p));
+  }, []);
+  const updateSelectedPadAdsr = useCallback((key, val) => {
+    setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, adsr: { ...p.adsr, [key]: val } } : p));
+  }, [selectedPad]);
+  const updateSelectedPadFilter = useCallback((key, val) => {
+    setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, filter: { ...p.filter, [key]: val } } : p));
+  }, [selectedPad]);
+  const updateSelectedPadDrive = useCallback((key, val) => {
+    setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, drive: { ...p.drive, [key]: val } } : p));
+  }, [selectedPad]);
+  const updateSelectedPadField = useCallback((key, val) => {
+    setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, [key]: val } : p));
+  }, [selectedPad]);
+
+  // Sync delay bus params to AudioCtx nodes
+  useEffect(() => {
+    if (AudioCtx.delayBus) {
+      AudioCtx.delayBus.delay.delayTime.value = delayBus.time;
+      AudioCtx.delayBus.feedback.gain.value = delayBus.feedback;
+    }
+  }, [delayBus]);
+  // Sync reverb bus params
+  useEffect(() => {
+    if (AudioCtx.reverbBus) {
+      AudioCtx.reverbBus.wet.gain.value = reverbBus.mix;
+    }
+  }, [reverbBus]);
+
+  // Convenience: current selected pad object
+  const selPad = pads[selectedPad] || pads[0];
 
   // ─── Init Audio ───
   const initAudio = useCallback(async () => {
@@ -462,16 +546,18 @@ export default function LEAPSampler() {
     const pad = padsRef.current[padIdx];
     if (!pad || !pad.assigned) return;
     const eng = engineRef.current;
-    const a = adsrRef.current;
-    const f = filterRef.current;
-    const d = delayRef.current;
+    const a = pad.adsr;
+    const f = pad.filter;
+    const dr = pad.drive;
     const len = buf.duration;
     const voice = AudioCtx.playSlice(buf, pad.sliceStart * len, pad.sliceEnd * len, {
       velocity,
       speed: eng.speed, reverse: eng.reverse, loop: eng.loop,
       attack: a.attack, decay: a.decay, sustain: a.sustain, release: a.release,
       filterType: f.type, filterFreq: f.freq, filterQ: f.q,
-      delayTime: d.time, delayFeedback: d.feedback, delayMix: d.mix
+      driveAmount: dr.amount, driveCurve: dr.curve,
+      delaySend: pad.delaySend, reverbSend: pad.reverbSend,
+      volume: pad.volume, pan: pad.pan,
     });
     if (voice) {
       // Choke: stop previous voice on same pad
@@ -528,18 +614,20 @@ export default function LEAPSampler() {
         releaseNoteRef.current?.(byte1, channel);
       }
       // CC messages — Launchkey 25 knobs send CC 21-28 on ch1
+      // Now controls the SELECTED pad's params
       else if (cmd === 0xB0) {
         const ccVal = byte2 / 127;
+        const si = selectedPadRef.current;
         switch (byte1) {
-          case 21: setFilter(f => ({ ...f, freq: 20 + ccVal * 19980 })); break;        // Knob 1 → Filter Freq
-          case 22: setFilter(f => ({ ...f, q: 0.1 + ccVal * 19.9 })); break;            // Knob 2 → Filter Q
-          case 23: setAdsr(a => ({ ...a, attack: ccVal * 2 })); break;                   // Knob 3 → Attack
-          case 24: setAdsr(a => ({ ...a, decay: ccVal * 2 })); break;                    // Knob 4 → Decay
-          case 25: setAdsr(a => ({ ...a, sustain: ccVal })); break;                      // Knob 5 → Sustain
-          case 26: setAdsr(a => ({ ...a, release: ccVal * 5 })); break;                  // Knob 6 → Release
-          case 27: setDelay(d => ({ ...d, time: ccVal })); break;                        // Knob 7 → Delay Time
-          case 28: setDelay(d => ({ ...d, mix: ccVal })); break;                         // Knob 8 → Delay Mix
-          case 1: setModWheel(ccVal); break;                                             // Mod Wheel
+          case 21: setPads(p => p.map((pd, i) => i === si ? { ...pd, filter: { ...pd.filter, freq: 20 + ccVal * 19980 } } : pd)); break;
+          case 22: setPads(p => p.map((pd, i) => i === si ? { ...pd, filter: { ...pd.filter, q: 0.1 + ccVal * 19.9 } } : pd)); break;
+          case 23: setPads(p => p.map((pd, i) => i === si ? { ...pd, adsr: { ...pd.adsr, attack: ccVal * 2 } } : pd)); break;
+          case 24: setPads(p => p.map((pd, i) => i === si ? { ...pd, adsr: { ...pd.adsr, decay: ccVal * 2 } } : pd)); break;
+          case 25: setPads(p => p.map((pd, i) => i === si ? { ...pd, adsr: { ...pd.adsr, sustain: ccVal } } : pd)); break;
+          case 26: setPads(p => p.map((pd, i) => i === si ? { ...pd, adsr: { ...pd.adsr, release: ccVal * 5 } } : pd)); break;
+          case 27: setPads(p => p.map((pd, i) => i === si ? { ...pd, delaySend: ccVal } : pd)); break;   // Knob 7 → Delay Send
+          case 28: setPads(p => p.map((pd, i) => i === si ? { ...pd, reverbSend: ccVal } : pd)); break;  // Knob 8 → Reverb Send
+          case 1: setModWheel(ccVal); break;
           default: break;
         }
       }
@@ -591,7 +679,7 @@ export default function LEAPSampler() {
     const len = buffer.getChannelData(0).length;
     const pts = [0, ...hitPoints.slice(0, 15), len];
     const newPads = Array.from({ length: 16 }, (_, i) => ({
-      id: i + 1, active: false,
+      ...createPad(i),
       assigned: i < pts.length - 1,
       sliceStart: i < pts.length - 1 ? pts[i] / len : i / 16,
       sliceEnd: i < pts.length - 1 ? pts[i + 1] / len : (i + 1) / 16
@@ -720,12 +808,13 @@ export default function LEAPSampler() {
     paramLabel: { fontSize: 8, color: "#445566", letterSpacing: 1, textTransform: "uppercase" },
     paramValue: { fontSize: 16, color: "#00e5ff", fontWeight: 600, fontFamily: "inherit" },
     padGrid: { display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 6 },
-    pad: (active, assigned) => ({
+    pad: (active, assigned, selected) => ({
       aspectRatio: "1", borderRadius: "50%", cursor: "pointer", position: "relative",
       background: active ? "radial-gradient(circle, #00e5ff 0%, #006680 100%)"
         : assigned ? "radial-gradient(circle at 40% 35%, #1a2535 0%, #0d1520 100%)" : "#0a0e14",
-      border: `2px solid ${active ? "#00e5ff" : assigned ? "#1a3040" : "#0f1520"}`,
-      boxShadow: active ? "0 0 20px rgba(0,229,255,0.4), inset 0 0 10px rgba(0,229,255,0.2)" : "none",
+      border: `2px solid ${active ? "#00e5ff" : selected ? "#00e5ff88" : assigned ? "#1a3040" : "#0f1520"}`,
+      boxShadow: active ? "0 0 20px rgba(0,229,255,0.4), inset 0 0 10px rgba(0,229,255,0.2)"
+        : selected ? "0 0 12px rgba(0,229,255,0.15)" : "none",
       display: "flex", alignItems: "center", justifyContent: "center",
       transition: "all 0.1s", transform: active ? "scale(0.95)" : "scale(1)"
     }),
@@ -987,41 +1076,102 @@ export default function LEAPSampler() {
         </div>
       </div>
 
-      {/* SIGNAL CHAIN - ADSR + Filter + LFO + Delay */}
+      {/* SIGNAL CHAIN — per-pad controls for selected pad */}
       <div style={{ ...sty.section, padding: "8px 16px" }}>
+        {/* Pad label + Copy/Paste */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+          <span style={{ fontSize: 13, color: "#00e5ff", fontWeight: 600, letterSpacing: 2 }}>
+            PAD {selPad.id}
+          </span>
+          <button onClick={() => setPadClipboard(JSON.parse(JSON.stringify({
+            adsr: selPad.adsr, filter: selPad.filter, drive: selPad.drive,
+            delaySend: selPad.delaySend, reverbSend: selPad.reverbSend,
+            volume: selPad.volume, pan: selPad.pan
+          })))} style={{
+            background: "rgba(0,229,255,0.08)", border: "1px solid #00e5ff22", borderRadius: 4,
+            padding: "3px 10px", color: "#00e5ff", fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 0.5
+          }}>COPY</button>
+          <button onClick={() => {
+            if (!padClipboard) return;
+            setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, ...JSON.parse(JSON.stringify(padClipboard)) } : p));
+          }} style={{
+            background: padClipboard ? "rgba(0,229,255,0.08)" : "rgba(255,255,255,0.02)",
+            border: `1px solid ${padClipboard ? "#00e5ff22" : "#ffffff08"}`, borderRadius: 4,
+            padding: "3px 10px", color: padClipboard ? "#00e5ff" : "#334455", fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 0.5
+          }}>PASTE</button>
+          <div style={{ flex: 1 }} />
+          <span style={{ fontSize: 8, color: "#334455" }}>
+            {selPad.assigned ? `Slice ${(selPad.sliceStart * 100).toFixed(0)}%-${(selPad.sliceEnd * 100).toFixed(0)}%` : "Unassigned"}
+          </span>
+        </div>
         <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
-          {/* ADSR */}
+          {/* ADSR — per pad */}
           <div>
             <div style={sty.sectionTitle}>ENVELOPE</div>
             <div style={{ display: "flex", gap: 10 }}>
-              <Knob value={adsr.attack} min={0} max={2} onChange={v => setAdsr(a => ({ ...a, attack: v }))}
-                label="ATK" displayValue={adsr.attack.toFixed(3)} />
-              <Knob value={adsr.decay} min={0} max={2} onChange={v => setAdsr(a => ({ ...a, decay: v }))}
-                label="DEC" displayValue={adsr.decay.toFixed(2)} />
-              <Knob value={adsr.sustain} min={0} max={1} onChange={v => setAdsr(a => ({ ...a, sustain: v }))}
-                label="SUS" displayValue={adsr.sustain.toFixed(2)} />
-              <Knob value={adsr.release} min={0} max={5} onChange={v => setAdsr(a => ({ ...a, release: v }))}
-                label="REL" displayValue={adsr.release.toFixed(2)} />
+              <Knob value={selPad.adsr.attack} min={0} max={2} onChange={v => updateSelectedPadAdsr("attack", v)}
+                label="ATK" displayValue={selPad.adsr.attack.toFixed(3)} />
+              <Knob value={selPad.adsr.decay} min={0} max={2} onChange={v => updateSelectedPadAdsr("decay", v)}
+                label="DEC" displayValue={selPad.adsr.decay.toFixed(2)} />
+              <Knob value={selPad.adsr.sustain} min={0} max={1} onChange={v => updateSelectedPadAdsr("sustain", v)}
+                label="SUS" displayValue={selPad.adsr.sustain.toFixed(2)} />
+              <Knob value={selPad.adsr.release} min={0} max={5} onChange={v => updateSelectedPadAdsr("release", v)}
+                label="REL" displayValue={selPad.adsr.release.toFixed(2)} />
             </div>
           </div>
-          {/* Filter */}
+          {/* Filter — per pad */}
           <div>
             <div style={sty.sectionTitle}>FILTER</div>
             <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 {["lowpass", "highpass", "bandpass", "notch"].map(ft => (
-                  <Toggle key={ft} active={filter.type === ft} onClick={() => setFilter(f => ({ ...f, type: ft }))}>
+                  <Toggle key={ft} active={selPad.filter.type === ft} onClick={() => updateSelectedPadFilter("type", ft)}>
                     {ft.slice(0, 2).toUpperCase()}
                   </Toggle>
                 ))}
               </div>
-              <Knob value={filter.freq} min={20} max={20000} onChange={v => setFilter(f => ({ ...f, freq: v }))}
-                label="FREQ" displayValue={filter.freq < 1000 ? filter.freq.toFixed(0) + "Hz" : (filter.freq / 1000).toFixed(1) + "k"} />
-              <Knob value={filter.q} min={0.1} max={20} onChange={v => setFilter(f => ({ ...f, q: v }))}
-                label="Q" displayValue={filter.q.toFixed(1)} />
+              <Knob value={selPad.filter.freq} min={20} max={20000} onChange={v => updateSelectedPadFilter("freq", v)}
+                label="FREQ" displayValue={selPad.filter.freq < 1000 ? selPad.filter.freq.toFixed(0) + "Hz" : (selPad.filter.freq / 1000).toFixed(1) + "k"} />
+              <Knob value={selPad.filter.q} min={0.1} max={20} onChange={v => updateSelectedPadFilter("q", v)}
+                label="Q" displayValue={selPad.filter.q.toFixed(1)} />
             </div>
           </div>
-          {/* LFO */}
+          {/* Drive — per pad */}
+          <div>
+            <div style={sty.sectionTitle}>DRIVE</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+              <Knob value={selPad.drive.amount} min={0} max={1} onChange={v => updateSelectedPadDrive("amount", v)}
+                label="AMT" displayValue={(selPad.drive.amount * 100).toFixed(0) + "%"} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                {["soft", "hard", "clip"].map(c => (
+                  <Toggle key={c} active={selPad.drive.curve === c} onClick={() => updateSelectedPadDrive("curve", c)}>
+                    {c.toUpperCase()}
+                  </Toggle>
+                ))}
+              </div>
+            </div>
+          </div>
+          {/* Volume + Pan — per pad */}
+          <div>
+            <div style={sty.sectionTitle}>OUTPUT</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Knob value={selPad.volume} min={0} max={2} onChange={v => updateSelectedPadField("volume", v)}
+                label="VOL" displayValue={(selPad.volume * 100).toFixed(0) + "%"} />
+              <Knob value={selPad.pan} min={-1} max={1} onChange={v => updateSelectedPadField("pan", v)}
+                label="PAN" displayValue={selPad.pan === 0 ? "C" : (selPad.pan < 0 ? "L" + (-selPad.pan * 100).toFixed(0) : "R" + (selPad.pan * 100).toFixed(0))} />
+            </div>
+          </div>
+          {/* Send levels — per pad */}
+          <div>
+            <div style={sty.sectionTitle}>SENDS</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Knob value={selPad.delaySend} min={0} max={1} onChange={v => updateSelectedPadField("delaySend", v)}
+                label="DLY" displayValue={(selPad.delaySend * 100).toFixed(0) + "%"} />
+              <Knob value={selPad.reverbSend} min={0} max={1} onChange={v => updateSelectedPadField("reverbSend", v)}
+                label="REV" displayValue={(selPad.reverbSend * 100).toFixed(0) + "%"} />
+            </div>
+          </div>
+          {/* LFO (global) */}
           <div>
             <div style={sty.sectionTitle}>LFO 1</div>
             <div style={{ display: "flex", gap: 10 }}>
@@ -1038,26 +1188,24 @@ export default function LEAPSampler() {
               </div>
             </div>
           </div>
-          {/* Delay */}
+          {/* Delay Bus (shared) */}
           <div>
-            <div style={sty.sectionTitle}>DELAY</div>
+            <div style={sty.sectionTitle}>DELAY BUS</div>
             <div style={{ display: "flex", gap: 10 }}>
-              <Knob value={delay.time} min={0} max={1} onChange={v => setDelay(d => ({ ...d, time: v }))}
-                label="TIME" displayValue={(delay.time * 1000).toFixed(0) + "ms"} />
-              <Knob value={delay.feedback} min={0} max={0.95} onChange={v => setDelay(d => ({ ...d, feedback: v }))}
-                label="FB" displayValue={(delay.feedback * 100).toFixed(0) + "%"} />
-              <Knob value={delay.mix} min={0} max={1} onChange={v => setDelay(d => ({ ...d, mix: v }))}
-                label="MIX" displayValue={(delay.mix * 100).toFixed(0) + "%"} />
+              <Knob value={delayBus.time} min={0} max={1} onChange={v => setDelayBus(d => ({ ...d, time: v }))}
+                label="TIME" displayValue={(delayBus.time * 1000).toFixed(0) + "ms"} />
+              <Knob value={delayBus.feedback} min={0} max={0.95} onChange={v => setDelayBus(d => ({ ...d, feedback: v }))}
+                label="FB" displayValue={(delayBus.feedback * 100).toFixed(0) + "%"} />
             </div>
           </div>
-          {/* Reverb */}
+          {/* Reverb Bus (shared) */}
           <div>
-            <div style={sty.sectionTitle}>REVERB</div>
+            <div style={sty.sectionTitle}>REVERB BUS</div>
             <div style={{ display: "flex", gap: 10 }}>
-              <Knob value={reverb.size} min={0} max={1} onChange={v => setReverb(r => ({ ...r, size: v }))}
-                label="SIZE" displayValue={(reverb.size * 100).toFixed(0) + "%"} />
-              <Knob value={reverb.mix} min={0} max={1} onChange={v => setReverb(r => ({ ...r, mix: v }))}
-                label="MIX" displayValue={(reverb.mix * 100).toFixed(0) + "%"} />
+              <Knob value={reverbBus.size} min={0} max={1} onChange={v => setReverbBus(r => ({ ...r, size: v }))}
+                label="SIZE" displayValue={(reverbBus.size * 100).toFixed(0) + "%"} />
+              <Knob value={reverbBus.mix} min={0} max={1} onChange={v => setReverbBus(r => ({ ...r, mix: v }))}
+                label="MIX" displayValue={(reverbBus.mix * 100).toFixed(0) + "%"} />
             </div>
           </div>
         </div>
@@ -1090,7 +1238,7 @@ export default function LEAPSampler() {
         <div style={sty.padGrid}>
           {pads.map((pad, i) => (
             <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-              <div style={sty.pad(pad.active, pad.assigned)}
+              <div style={sty.pad(pad.active, pad.assigned, i === selectedPad)}
                 onMouseDown={() => { setSelectedPad(i); triggerNote(60 + i, 0.8); }}
                 onMouseUp={() => releaseNote(60 + i)}
                 onMouseLeave={() => { if (pad.active) releaseNote(60 + i); }}>
@@ -1233,7 +1381,7 @@ export default function LEAPSampler() {
       <div style={{ padding: "6px 16px", display: "flex", justifyContent: "space-between",
         fontSize: 8, color: "#334455", borderTop: "1px solid #1a2030" }}>
         <span>LEAP Sampler Engine • Web Audio API</span>
-        <span>Keys: Z-M / A-K • Launchkey Pads: 36-51 • Knobs: CC21-28 → Filter/ADSR/Delay</span>
+        <span>Keys: Z-M / A-K • Launchkey Pads: 36-51 • Knobs: CC21-28 → Selected Pad</span>
         <span>{buffer ? `${buffer.duration.toFixed(2)}s • ${buffer.sampleRate}Hz` : "No buffer"}</span>
       </div>
     </div>
