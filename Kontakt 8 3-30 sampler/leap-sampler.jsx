@@ -384,6 +384,10 @@ export default function LEAPSampler() {
   const [activeTab, setActiveTab] = useState("edit");
   const [voices, setVoices] = useState(8);
   const [mono, setMono] = useState(true);
+  const [dragOver, setDragOver] = useState(false);
+  // Undo/redo history
+  const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
   // Refs
   const overviewCanvas = useRef(null);
   const detailCanvas = useRef(null);
@@ -437,6 +441,162 @@ export default function LEAPSampler() {
 
   // Convenience: current selected pad object
   const selPad = pads[selectedPad] || pads[0];
+
+  // Pad canvas refs for mini waveform thumbnails
+  const padCanvasRefs = useRef(Array.from({ length: 16 }, () => null));
+
+  // ─── Undo/Redo system ───
+  const pushUndo = useCallback((prevPads) => {
+    setUndoStack(prev => [...prev.slice(-49), prevPads]);
+    setRedoStack([]);
+  }, []);
+
+  const undo = useCallback(() => {
+    setUndoStack(prev => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setRedoStack(r => [...r, pads]);
+      setPads(last);
+      return prev.slice(0, -1);
+    });
+  }, [pads]);
+
+  const redo = useCallback(() => {
+    setRedoStack(prev => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setUndoStack(u => [...u, pads]);
+      setPads(last);
+      return prev.slice(0, -1);
+    });
+  }, [pads]);
+
+  // Wrap setPads to auto-push undo (for user-facing edits via copy-paste)
+  const setPadsWithUndo = useCallback((updater) => {
+    setPads(prev => {
+      pushUndo(prev);
+      return typeof updater === "function" ? updater(prev) : updater;
+    });
+  }, [pushUndo]);
+
+  // Debounced undo push: only snapshot once per drag gesture (mousedown → mouseup)
+  const undoSnapshotRef = useRef(null);
+  const captureUndoSnapshot = useCallback(() => {
+    undoSnapshotRef.current = pads;
+  }, [pads]);
+  const commitUndoSnapshot = useCallback(() => {
+    if (undoSnapshotRef.current) {
+      pushUndo(undoSnapshotRef.current);
+      undoSnapshotRef.current = null;
+    }
+  }, [pushUndo]);
+
+  // ─── Drag-and-drop handler ───
+  const handleDrop = useCallback(async (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith("audio/")) {
+      const ctx = AudioCtx.init();
+      await AudioCtx.initWorklet();
+      const arrayBuf = await file.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(arrayBuf);
+      setBuffer(decoded);
+      setSampleName(file.name.replace(/\.[^.]+$/, ""));
+      setSampleInfo(`${decoded.duration.toFixed(2)}s / ${engine.bpm}bpm / None`);
+      setMarkers({ S: 0, L: 0.5, E: 1 });
+      setViewRange({ start: 0, end: 1 });
+      detectHitPoints(decoded, hitSensitivity);
+      setAudioReady(true);
+    }
+  }, [engine.bpm, hitSensitivity]);
+
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e) => {
+    if (e.currentTarget.contains(e.relatedTarget)) return;
+    setDragOver(false);
+  }, []);
+
+  // ─── Waveform zoom/scroll via mouse wheel ───
+  const handleWaveformWheel = useCallback((e) => {
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const mouseX = (e.clientX - rect.left) / rect.width;
+    setViewRange(prev => {
+      const span = prev.end - prev.start;
+      if (e.shiftKey) {
+        // Shift+wheel = scroll horizontally
+        const scrollAmt = span * 0.1 * Math.sign(e.deltaY);
+        let newStart = prev.start + scrollAmt;
+        let newEnd = prev.end + scrollAmt;
+        if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+        if (newEnd > 1) { newStart -= (newEnd - 1); newEnd = 1; }
+        return { start: Math.max(0, newStart), end: Math.min(1, newEnd) };
+      } else {
+        // Wheel = zoom centered on cursor
+        const zoomFactor = e.deltaY > 0 ? 1.15 : 0.85;
+        const newSpan = Math.max(0.01, Math.min(1, span * zoomFactor));
+        const anchor = prev.start + mouseX * span;
+        let newStart = anchor - mouseX * newSpan;
+        let newEnd = anchor + (1 - mouseX) * newSpan;
+        if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+        if (newEnd > 1) { newStart -= (newEnd - 1); newEnd = 1; }
+        return { start: Math.max(0, newStart), end: Math.min(1, newEnd) };
+      }
+    });
+  }, []);
+
+  // ─── Draw mini waveforms in pads ───
+  useEffect(() => {
+    if (!buffer) return;
+    const data = buffer.getChannelData(0);
+    const totalLen = data.length;
+    pads.forEach((pad, i) => {
+      const canvas = padCanvasRefs.current[i];
+      if (!canvas || !pad.assigned) return;
+      const w = canvas.width;
+      const h = canvas.height;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, w, h);
+      const startIdx = Math.floor(pad.sliceStart * totalLen);
+      const endIdx = Math.floor(pad.sliceEnd * totalLen);
+      const range = endIdx - startIdx;
+      if (range <= 0) return;
+      const step = Math.max(1, Math.floor(range / w));
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const idx = startIdx + Math.floor((x / w) * range);
+        let mn = 1, mx = -1;
+        for (let j = 0; j < step; j++) {
+          const s = idx + j < totalLen ? data[idx + j] : 0;
+          if (s < mn) mn = s;
+          if (s > mx) mx = s;
+        }
+        const y1 = (1 - mx) * h / 2;
+        const y2 = (1 - mn) * h / 2;
+        if (x === 0) ctx.moveTo(x, y1); else ctx.lineTo(x, y1);
+        ctx.lineTo(x, y2);
+      }
+      ctx.strokeStyle = pad.active ? "#0d1117" : "rgba(0,229,255,0.5)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+  }, [buffer, pads]);
+
+  // ─── Keyboard: undo/redo ───
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && e.shiftKey) { e.preventDefault(); redo(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "y") { e.preventDefault(); redo(); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [undo, redo]);
 
   // ─── Init Audio ───
   const initAudio = useCallback(async () => {
@@ -739,6 +899,7 @@ export default function LEAPSampler() {
     const angle = ((value - min) / (max - min)) * 270 - 135;
     const handleMouseDown = (e) => {
       e.preventDefault();
+      captureUndoSnapshot();
       dragRef.current = { startY: e.clientY, startVal: value };
       const move = (ev) => {
         const dy = dragRef.current.startY - ev.clientY;
@@ -746,13 +907,14 @@ export default function LEAPSampler() {
         const newVal = Math.max(min, Math.min(max, dragRef.current.startVal + (dy / 150) * range));
         onChange(newVal);
       };
-      const up = () => { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); };
+      const up = () => { commitUndoSnapshot(); document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); };
       document.addEventListener("mousemove", move);
       document.addEventListener("mouseup", up);
     };
     return (
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, userSelect: "none" }}>
         <div ref={knobRef} onMouseDown={handleMouseDown} onTouchStart={(e) => {
+          captureUndoSnapshot();
           const touch = e.touches[0];
           dragRef.current = { startY: touch.clientY, startVal: value };
           const move = (ev) => {
@@ -760,7 +922,7 @@ export default function LEAPSampler() {
             const range = max - min;
             onChange(Math.max(min, Math.min(max, dragRef.current.startVal + (dy / 150) * range)));
           };
-          const end = () => { document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); };
+          const end = () => { commitUndoSnapshot(); document.removeEventListener("touchmove", move); document.removeEventListener("touchend", end); };
           document.addEventListener("touchmove", move);
           document.addEventListener("touchend", end);
         }}
@@ -847,10 +1009,14 @@ export default function LEAPSampler() {
   if (!audioReady) {
     return (
       <div style={{ ...sty.root, display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh",
-        background: "radial-gradient(circle at 50% 40%, #0d1520, #060a0f)" }}>
+        background: "radial-gradient(circle at 50% 40%, #0d1520, #060a0f)",
+        border: dragOver ? "2px solid #00e5ff" : "1px solid #1a2030" }}
+        onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
         <div style={{ textAlign: "center" }}>
           <div style={{ fontSize: 36, fontWeight: 200, color: "#00e5ff", letterSpacing: 12, marginBottom: 4 }}>LEAP</div>
-          <div style={{ fontSize: 10, color: "#334455", letterSpacing: 4, marginBottom: 32 }}>SAMPLER ENGINE</div>
+          <div style={{ fontSize: 10, color: "#334455", letterSpacing: 4, marginBottom: dragOver ? 12 : 32 }}>SAMPLER ENGINE</div>
+          {dragOver && <div style={{ fontSize: 11, color: "#00e5ff", letterSpacing: 2, marginBottom: 20,
+            animation: "pulse 1s infinite" }}>DROP AUDIO FILE</div>}
           <button onClick={initAudio} style={{
             background: "linear-gradient(180deg, rgba(0,229,255,0.12), rgba(0,229,255,0.04))",
             border: "1px solid #00e5ff33", borderRadius: 6, padding: "14px 40px",
@@ -874,7 +1040,16 @@ export default function LEAPSampler() {
   }
 
   return (
-    <div style={sty.root}>
+    <div style={{ ...sty.root, border: dragOver ? "2px solid #00e5ff" : "1px solid #1a2030", position: "relative" }}
+      onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+      {/* Drag overlay */}
+      {dragOver && <div style={{ position: "absolute", inset: 0, background: "rgba(0,229,255,0.06)",
+        zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+        <div style={{ fontSize: 16, color: "#00e5ff", letterSpacing: 4, fontWeight: 200,
+          border: "2px dashed #00e5ff44", borderRadius: 12, padding: "24px 48px" }}>
+          DROP AUDIO FILE
+        </div>
+      </div>}
       {/* HEADER */}
       <div style={sty.header}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -949,7 +1124,8 @@ export default function LEAPSampler() {
       <div style={{ ...sty.section, padding: "2px 16px 8px" }}>
         <canvas ref={detailCanvas} style={{ ...sty.canvas, height: 160 }}
           onMouseDown={e => handleCanvasMouseDown(e, false)}
-          onMouseMove={handleCanvasMouseMove} onMouseUp={handleCanvasMouseUp} />
+          onMouseMove={handleCanvasMouseMove} onMouseUp={handleCanvasMouseUp}
+          onWheel={handleWaveformWheel} />
       </div>
 
       {/* HIT POINT SENSITIVITY */}
@@ -1093,7 +1269,7 @@ export default function LEAPSampler() {
           }}>COPY</button>
           <button onClick={() => {
             if (!padClipboard) return;
-            setPads(prev => prev.map((p, i) => i === selectedPad ? { ...p, ...JSON.parse(JSON.stringify(padClipboard)) } : p));
+            setPadsWithUndo(prev => prev.map((p, i) => i === selectedPad ? { ...p, ...JSON.parse(JSON.stringify(padClipboard)) } : p));
           }} style={{
             background: padClipboard ? "rgba(0,229,255,0.08)" : "rgba(255,255,255,0.02)",
             border: `1px solid ${padClipboard ? "#00e5ff22" : "#ffffff08"}`, borderRadius: 4,
@@ -1242,12 +1418,12 @@ export default function LEAPSampler() {
                 onMouseDown={() => { setSelectedPad(i); triggerNote(60 + i, 0.8); }}
                 onMouseUp={() => releaseNote(60 + i)}
                 onMouseLeave={() => { if (pad.active) releaseNote(60 + i); }}>
-                <svg width="20" height="12" viewBox="0 0 20 12" style={{ opacity: pad.assigned ? 0.6 : 0.15 }}>
-                  <path d="M2 6 C2 2, 6 2, 10 6 C14 2, 18 2, 18 6 C18 10, 14 10, 10 6 C6 10, 2 10, 2 6Z"
-                    fill="none" stroke={pad.active ? "#0d1117" : "#00e5ff"} strokeWidth="1.5" />
-                </svg>
+                <canvas ref={el => padCanvasRefs.current[i] = el}
+                  width={40} height={24}
+                  style={{ width: 20, height: 12, pointerEvents: "none",
+                    opacity: pad.assigned ? 0.8 : 0.15 }} />
               </div>
-              <span style={{ fontSize: 8, color: pad.active ? "#00e5ff" : "#334455" }}>{pad.id}</span>
+              <span style={{ fontSize: 8, color: i === selectedPad ? "#00e5ff" : pad.active ? "#00e5ff" : "#334455" }}>{pad.id}</span>
             </div>
           ))}
         </div>
@@ -1378,11 +1554,18 @@ export default function LEAPSampler() {
       </div>
 
       {/* FOOTER / STATUS */}
-      <div style={{ padding: "6px 16px", display: "flex", justifyContent: "space-between",
+      <div style={{ padding: "6px 16px", display: "flex", justifyContent: "space-between", alignItems: "center",
         fontSize: 8, color: "#334455", borderTop: "1px solid #1a2030" }}>
         <span>LEAP Sampler Engine • Web Audio API</span>
-        <span>Keys: Z-M / A-K • Launchkey Pads: 36-51 • Knobs: CC21-28 → Selected Pad</span>
-        <span>{buffer ? `${buffer.duration.toFixed(2)}s • ${buffer.sampleRate}Hz` : "No buffer"}</span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span>Zoom {((1 / (viewRange.end - viewRange.start)) * 100).toFixed(0)}%</span>
+          <span style={{ color: "#1a2535" }}>|</span>
+          <span style={{ cursor: undoStack.length ? "pointer" : "default", color: undoStack.length ? "#00e5ff" : "#1a2535" }}
+            onClick={undo}>Undo{undoStack.length > 0 && ` (${undoStack.length})`}</span>
+          <span style={{ cursor: redoStack.length ? "pointer" : "default", color: redoStack.length ? "#00e5ff" : "#1a2535" }}
+            onClick={redo}>Redo{redoStack.length > 0 && ` (${redoStack.length})`}</span>
+        </div>
+        <span>{buffer ? `${buffer.duration.toFixed(2)}s • ${buffer.sampleRate}Hz • Drop audio to load` : "No buffer • Drop audio to load"}</span>
       </div>
     </div>
   );
