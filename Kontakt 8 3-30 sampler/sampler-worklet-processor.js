@@ -113,6 +113,17 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
     this._driveAmount = 0; // 0 = clean, 1 = full saturation
     this._driveCurve = "soft"; // "soft", "hard", "clip"
 
+    // Granular timestretch
+    this._granular = false;
+    this._stretch = 1.0; // time stretch ratio: >1 = slower, <1 = faster
+    this._grainSize = 2048; // grain size in samples
+    this._grainOverlap = 4; // number of overlapping grains
+    this._grainPhase = 0; // output sample counter within current grain cycle
+    this._grainSourcePos = 0; // source position (advances at 1/stretch rate)
+    // Pre-compute Hann window (allocated once, reused)
+    this._hannWindow = null;
+    this._hannWindowSize = 0;
+
     // Parse processor options if provided
     if (options && options.processorOptions) {
       this._applyOptions(options.processorOptions);
@@ -135,6 +146,18 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
     if (opts.filterQ !== undefined) this._filterQ = opts.filterQ;
     if (opts.driveAmount !== undefined) this._driveAmount = opts.driveAmount;
     if (opts.driveCurve !== undefined) this._driveCurve = opts.driveCurve;
+    if (opts.granular !== undefined) this._granular = opts.granular;
+    if (opts.stretch !== undefined) this._stretch = Math.max(0.25, Math.min(4, opts.stretch));
+    if (opts.grainSize !== undefined) this._grainSize = opts.grainSize;
+  }
+
+  _ensureHannWindow(size) {
+    if (this._hannWindowSize === size) return;
+    this._hannWindow = new Float32Array(size);
+    for (let i = 0; i < size; i++) {
+      this._hannWindow[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (size - 1)));
+    }
+    this._hannWindowSize = size;
   }
 
   _handleMessage(msg) {
@@ -189,6 +212,15 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
         this._envLevel = 0;
         this._playing = true;
         this._finished = false;
+
+        // Granular init
+        if (this._granular) {
+          this._ensureHannWindow(this._grainSize);
+          this._grainPhase = 0;
+          this._grainSourcePos = this._reverse
+            ? this._endSample - 1
+            : this._startSample;
+        }
         break;
       }
       case "release": {
@@ -273,6 +305,81 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
         const out = Math.tanh(driven);
         // Compensate output level
         return out * (1 / Math.tanh(gain));
+      }
+    }
+  }
+
+  // Read a granular-windowed sample: sum overlapping grains with Hann windows
+  _readGranularSample(ch, outputIdx) {
+    const bufCh = ch < this._bufferChannels ? ch : 0;
+    const grainSize = this._grainSize;
+    const overlap = this._grainOverlap;
+    const hopSize = Math.floor(grainSize / overlap);
+    const sourceHop = hopSize / this._stretch; // source advances slower when stretching
+    let sum = 0;
+
+    for (let g = 0; g < overlap; g++) {
+      const grainOffset = g * hopSize;
+      const posInGrain = (this._grainPhase + grainOffset) % grainSize;
+      const grainStartSource = this._grainSourcePos +
+        (this._reverse ? -1 : 1) * (g * sourceHop);
+
+      // Source position within this grain
+      const srcPos = grainStartSource +
+        (this._reverse ? -1 : 1) * (posInGrain / grainSize) * grainSize * this._speed;
+
+      // Clamp to slice bounds
+      let clampedPos = srcPos;
+      if (this._loop) {
+        const range = this._endSample - this._startSample;
+        if (range > 0) {
+          clampedPos = this._startSample +
+            (((clampedPos - this._startSample) % range) + range) % range;
+        }
+      } else {
+        if (clampedPos < this._startSample || clampedPos >= this._endSample) {
+          continue;
+        }
+      }
+
+      const windowVal = this._hannWindow[posInGrain] || 0;
+      sum += this._readSample(bufCh, clampedPos) * windowVal;
+    }
+
+    return sum / (overlap * 0.5); // normalize (Hann overlap-add)
+  }
+
+  // Advance granular position by one output sample
+  _advanceGranular() {
+    const grainSize = this._grainSize;
+    const hopSize = Math.floor(grainSize / this._grainOverlap);
+    const sourceHop = hopSize / this._stretch;
+
+    this._grainPhase++;
+    if (this._grainPhase >= hopSize) {
+      this._grainPhase = 0;
+      // Advance source position by one hop
+      this._grainSourcePos += (this._reverse ? -1 : 1) * sourceHop;
+
+      // Check bounds
+      if (this._reverse) {
+        if (this._grainSourcePos < this._startSample) {
+          if (this._loop) {
+            this._grainSourcePos = this._endSample - 1;
+          } else {
+            this._playing = false;
+            this._finished = true;
+          }
+        }
+      } else {
+        if (this._grainSourcePos >= this._endSample) {
+          if (this._loop) {
+            this._grainSourcePos = this._startSample;
+          } else {
+            this._playing = false;
+            this._finished = true;
+          }
+        }
       }
     }
   }
@@ -395,24 +502,24 @@ class SamplerWorkletProcessor extends AudioWorkletProcessor {
 
       // Read and process each channel
       for (let ch = 0; ch < numChannels; ch++) {
-        // Read from buffer (map output channels to available buffer channels)
         const bufCh = ch < this._bufferChannels ? ch : 0;
-        let sample = this._readSample(bufCh, this._playbackPos);
+        let sample = this._granular
+          ? this._readGranularSample(bufCh, i)
+          : this._readSample(bufCh, this._playbackPos);
 
-        // Apply biquad filter
         sample = this._applyFilter(sample, bufCh);
-
-        // Apply drive/saturation
         sample = this._applyDrive(sample);
-
-        // Apply envelope
         sample *= envLevel;
 
         output[ch][i] = sample;
       }
 
       // Advance playback position
-      this._advancePosition();
+      if (this._granular) {
+        this._advanceGranular();
+      } else {
+        this._advancePosition();
+      }
     }
 
     if (this._finished) {

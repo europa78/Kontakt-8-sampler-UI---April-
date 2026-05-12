@@ -162,6 +162,9 @@ const AudioCtx = {
       filterQ: params.filterQ || 1,
       driveAmount: params.driveAmount || 0,
       driveCurve: params.driveCurve || "soft",
+      granular: params.granular || false,
+      stretch: params.stretch || 1.0,
+      grainSize: params.grainSize || 2048,
     };
 
     // Create AudioWorkletNode for this voice
@@ -218,8 +221,97 @@ const AudioCtx = {
         }, (r + 0.05) * 1000);
       },
     };
-  }
+  },
+  async exportWav(buffer, start, end, params = {}) {
+    if (!buffer) return null;
+    const sr = buffer.sampleRate;
+    const numChannels = buffer.numberOfChannels;
+    const startSample = Math.floor(start * sr);
+    const endSample = Math.floor(end * sr);
+    const sliceLen = endSample - startSample;
+    const stretch = (params.granular && params.stretch) ? params.stretch : 1;
+    const duration = (sliceLen / sr) * stretch + (params.release || 0.2) + 0.1;
+    const offlineCtx = new OfflineAudioContext(numChannels, Math.ceil(duration * sr), sr);
+    await offlineCtx.audioWorklet.addModule("sampler-worklet-processor.js");
+
+    const procOpts = {
+      velocity: params.velocity || 1,
+      speed: params.speed || 1,
+      reverse: params.reverse || false,
+      loop: false,
+      attack: params.attack || 0.005,
+      decay: params.decay || 0.1,
+      sustain: params.sustain || 0.7,
+      release: params.release || 0.2,
+      filterType: params.filterType || "lowpass",
+      filterFreq: params.filterFreq || 8000,
+      filterQ: params.filterQ || 1,
+      driveAmount: params.driveAmount || 0,
+      driveCurve: params.driveCurve || "soft",
+      granular: params.granular || false,
+      stretch: params.stretch || 1.0,
+      grainSize: params.grainSize || 2048,
+    };
+
+    const node = new AudioWorkletNode(offlineCtx, "sampler-worklet-processor", {
+      numberOfInputs: 0, numberOfOutputs: 1,
+      outputChannelCount: [numChannels],
+      processorOptions: procOpts,
+    });
+
+    const channelData = this._getChannelData(buffer);
+    node.port.postMessage({ type: "loadBuffer", channelData });
+    node.port.postMessage({ type: "play", startSample, endSample, params: procOpts });
+
+    node.connect(offlineCtx.destination);
+
+    const releaseAt = (sliceLen / sr) * stretch;
+    offlineCtx.suspend(releaseAt).then(() => {
+      node.port.postMessage({ type: "release" });
+      offlineCtx.resume();
+    });
+
+    const rendered = await offlineCtx.startRendering();
+    return rendered;
+  },
 };
+
+function encodeWav(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sr = audioBuffer.sampleRate;
+  const length = audioBuffer.length;
+  const bytesPerSample = 2;
+  const dataSize = length * numChannels * bytesPerSample;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+
+  const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sr, true);
+  view.setUint32(28, sr * numChannels * bytesPerSample, true);
+  view.setUint16(32, numChannels * bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  const channels = [];
+  for (let ch = 0; ch < numChannels; ch++) channels.push(audioBuffer.getChannelData(ch));
+  let offset = 44;
+  for (let i = 0; i < length; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const s = Math.max(-1, Math.min(1, channels[ch][i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
 
 // ─── Default per-pad signal chain params ───
 const DEFAULT_PAD_PARAMS = {
@@ -350,7 +442,8 @@ export default function LEAPSampler() {
   const [engine, setEngine] = useState({
     type: "melody", hq: false, formants: false, reverse: false,
     bpm: 128, sync: true, speed: 1, tonality: "None", tune: 0,
-    loop: true, triggerStyle: "Latch", choke: "Off"
+    loop: true, triggerStyle: "Latch", choke: "Off",
+    granular: false, stretch: 1.0,
   });
   // Pad state (each pad has its own signal chain params)
   const [pads, setPads] = useState(Array.from({ length: 16 }, (_, i) => createPad(i)));
@@ -609,6 +702,39 @@ export default function LEAPSampler() {
     detectHitPoints(buf, hitSensitivity);
   }, []);
 
+  // ─── WAV Export ───
+  const [exporting, setExporting] = useState(false);
+  const exportPad = useCallback(async () => {
+    if (!buffer || exporting) return;
+    setExporting(true);
+    try {
+      const pad = pads[selectedPad];
+      const a = pad.adsr;
+      const f = pad.filter;
+      const dr = pad.drive;
+      const eng = engine;
+      const len = buffer.duration;
+      const rendered = await AudioCtx.exportWav(buffer, pad.sliceStart * len, pad.sliceEnd * len, {
+        velocity: 1, speed: eng.speed, reverse: eng.reverse,
+        attack: a.attack, decay: a.decay, sustain: a.sustain, release: a.release,
+        filterType: f.type, filterFreq: f.freq, filterQ: f.q,
+        driveAmount: dr.amount, driveCurve: dr.curve,
+        granular: eng.granular, stretch: eng.stretch,
+      });
+      if (rendered) {
+        const blob = encodeWav(rendered);
+        const url = URL.createObjectURL(blob);
+        const a2 = document.createElement("a");
+        a2.href = url;
+        a2.download = `${sampleName}_pad${pad.id}.wav`;
+        a2.click();
+        URL.revokeObjectURL(url);
+      }
+    } finally {
+      setExporting(false);
+    }
+  }, [buffer, pads, selectedPad, engine, sampleName, exporting]);
+
   // ─── Hit Point Detection ───
   const detectHitPoints = useCallback((buf, sensitivity) => {
     if (!buf) return;
@@ -718,6 +844,7 @@ export default function LEAPSampler() {
       driveAmount: dr.amount, driveCurve: dr.curve,
       delaySend: pad.delaySend, reverbSend: pad.reverbSend,
       volume: pad.volume, pan: pad.pan,
+      granular: eng.granular, stretch: eng.stretch,
     });
     if (voice) {
       // Choke: stop previous voice on same pad
@@ -1079,6 +1206,12 @@ export default function LEAPSampler() {
             background: "rgba(0,229,255,0.08)", border: "1px solid #00e5ff22", borderRadius: 4,
             padding: "4px 10px", color: "#00e5ff", fontSize: 9, cursor: "pointer", fontFamily: "inherit"
           }}>Load</button>
+          <button onClick={exportPad} disabled={exporting} style={{
+            background: exporting ? "rgba(255,200,0,0.04)" : "rgba(255,200,0,0.08)",
+            border: "1px solid rgba(255,200,0,0.2)", borderRadius: 4,
+            padding: "4px 10px", color: exporting ? "#665520" : "#ffc800", fontSize: 9,
+            cursor: exporting ? "wait" : "pointer", fontFamily: "inherit"
+          }}>{exporting ? "Rendering..." : "Export WAV"}</button>
           <input ref={fileInput} type="file" accept="audio/*" style={{ display: "none" }}
             onChange={e => e.target.files[0] && loadFile(e.target.files[0])} />
         </div>
@@ -1248,6 +1381,19 @@ export default function LEAPSampler() {
           {/* Legato */}
           <div style={sty.paramGroup}>
             <Toggle active={false}>Legato</Toggle>
+          </div>
+
+          {/* Timestretch */}
+          <div style={sty.paramGroup}>
+            <span style={sty.paramLabel}>STRETCH</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <Toggle active={engine.granular} onClick={() => setEngine(e => ({ ...e, granular: !e.granular }))} accent={engine.granular}>
+                {engine.granular ? "ON" : "OFF"}
+              </Toggle>
+              <Knob value={engine.stretch} min={0.25} max={4} onChange={v => setEngine(e => ({ ...e, stretch: v }))}
+                label="RATIO" displayValue={engine.stretch.toFixed(2) + "x"}
+                color={engine.granular ? "#00e5ff" : "#445566"} />
+            </div>
           </div>
         </div>
       </div>
